@@ -1,0 +1,105 @@
+name: Supabase Deploy (DB + Edge Functions + Frontend)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # --- Supabase / DB ---
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # --- Supabase CLI deploy auth ---
+      # هذا هو Token المطلوب لتسجيل دخول Supabase CLI (PAT)
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }} # project ref مثل: wshbywurteipkpsdrvlm
+
+      # --- Secrets داخل Edge Function runtime (اختياري حسب كود function) ---
+      # استخدم Secret keys إذا كان كودك يقرأ SUPABASE_SECRET_KEYS أو SUPABASE_SERVICE_ROLE_KEY
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+
+      # --- Vercel (اختياري) ---
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (psql + Node)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          node -v
+          npm -v
+
+      - name: Run DB migrations (Project-Genesis)
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+          psql "$DATABASE_URL" -f "Project-Genesis/database/migrations/001_db_improvements.sql"
+          psql "$DATABASE_URL" -f "Project-Genesis/database/migrations/002_seeds_and_indexes.sql"
+          psql "$DATABASE_URL" -f "Project-Genesis/database/migrations/003_core_engine.sql"
+
+          psql "$DATABASE_URL" -f "Project-Genesis/backend/sql/functions/process_evidence.sql"
+          psql "$DATABASE_URL" -f "Project-Genesis/backend/sql/triggers/trigger_evidence_after_insert.sql"
+
+          # قيد فريد (إن لزم) — لن تفشل إذا كان موجود
+          psql "$DATABASE_URL" -c "ALTER TABLE skill_scores ADD CONSTRAINT IF NOT EXISTS unique_user_skill UNIQUE (user_id, skill_id);" || true
+
+      - name: Install Supabase CLI
+        run: |
+          curl -sL https://github.com/supabase/cli/releases/latest/download/supabase_$(uname | tr '[:upper:]' '[:lower:]')_amd64.tar.gz | tar xz -C /tmp
+          sudo mv /tmp/supabase /usr/local/bin/supabase || true
+
+      - name: Login Supabase CLI (PAT)
+        run: |
+          echo "$SUPABASE_ACCESS_TOKEN" | supabase login --access-token
+
+      - name: Deploy Edge Function: submitAnswer
+        run: |
+          # Deploy جميع الكونتنتات الموجودة داخل functions folder الخاصة بمشروعك
+          # (يُفترض أن الكود موجود على نفس المسار الذي يستخدمه supabase cli)
+          supabase functions deploy submitAnswer --project-ref "$SUPABASE_PROJECT_REF"
+
+      - name: Build Frontend (local)
+        run: |
+          cd Project-Genesis/frontend
+
+          # .env مؤقت للـbuild فقط
+          echo "VITE_SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
+          echo "VITE_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" >> .env
+
+          # إن كان لديك متغير endpoint في الواجهة، اكتب/عدّل هنا حسب مشروعك
+          # (بدون معرفة exact name عندك لن أضع value افتراضية غير صحيحة)
+          # echo "VITE_SUBMIT_ANSWER_ENDPOINT=..." >> .env
+
+          npm ci || npm install
+          npm run build
+          cd ../..
+
+      - name: Deploy Frontend to Vercel (optional)
+        if: env.VERCEL_TOKEN != ''
+        run: |
+          npm i -g vercel
+          cd Project-Genesis/frontend
+
+          # .env لوقت التهيئة في Vercel build (اختياري)
+          echo "VITE_SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
+          echo "VITE_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" >> .env
+
+          # يمكن استخدام --project/--org إذا كانت Secrets متوفرة
+          # إذا لا تريد/لا تستخدمها، احذف هذه الخيارات
+          vercel --prod --token "$VERCEL_TOKEN" --confirm \
+            --project "$VERCEL_PROJECT_ID" \
+            --org "$VERCEL_ORG_ID"
+
+          cd ../..
